@@ -48,7 +48,10 @@ _SHEEPDOG_OPTS = [
     cfg.IntOpt('sheepdog_store_port', default=DEFAULT_PORT,
                help=_('Port of sheep daemon.')),
     cfg.StrOpt('sheepdog_store_address', default=DEFAULT_ADDR,
-               help=_('IP address of sheep daemon.'))
+               help=_('IP address of sheep daemon.')),
+    cfg.BoolOpt('sheepdog_clone_to_image',
+                default=False,
+                help=('Use clone operation when upload volume to image.'))
 ]
 
 
@@ -220,6 +223,8 @@ class Store(glance_store.driver.Store):
 
             self.addr = self.conf.glance_store.sheepdog_store_address
             self.port = self.conf.glance_store.sheepdog_store_port
+            self.cloneable = self.conf.glance_store.sheepdog_clone_to_image
+
         except cfg.ConfigFileValueError as e:
             reason = _("Error in store configuration: %s") % e
             LOG.error(reason)
@@ -293,55 +298,80 @@ class Store(glance_store.driver.Store):
 
         image = SheepdogImage(self.addr, self.port, image_id,
                               self.WRITE_CHUNKSIZE)
-        if image.exist():
-            raise exceptions.Duplicate(image=image_id)
+        if not self.cloneable:
+            if image.exist():
+                raise exceptions.Duplicate(image=image_id)
 
         location = StoreLocation({'image': image_id}, self.conf)
         checksum = hashlib.md5()
 
-        try:
-            if image_size == 0:
-                chunks = utils.chunkreadable(image_file,
-                                             self.WRITE_CHUNKSIZE)
-                for chunk in chunks:
-                    image_size += len(chunk)
+        if not self.cloneable:
+            try:
+                if image_size == 0:
+                    chunks = utils.chunkreadable(image_file,
+                                                 self.WRITE_CHUNKSIZE)
+                    for chunk in chunks:
+                        image_size += len(chunk)
 
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Fail to read image file: %(image)s.'),
-                          {'image': str(image_file)})
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.error(_LE('Fail to read image file: %(image)s.'),
+                              {'image': str(image_file)})
 
-        try:
-            image.create(image_size)
+            try:
+                image.create(image_size)
 
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Fail to create glance-image as Sheepdog VDI. '
-                              'src image file: %(image)s, size: %(size)s.'),
-                          {'image': image_file, 'size': image_size})
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.error(_LE('Fail to create glance-image '
+                                  'as Sheepdog VDI. src image file: '
+                                  '%(image)s, size: %(size)s.'),
+                              {'image': image_file, 'size': image_size})
 
-        try:
-            total = left = image_size
-            while left > 0:
-                length = min(self.chunk_size, left)
-                data = image_file.read(length)
-                image.write(data, total - left, length)
-                left -= length
-                checksum.update(data)
+            try:
+                total = left = image_size
+                while left > 0:
+                    length = min(self.chunk_size, left)
+                    data = image_file.read(length)
+                    image.write(data, total - left, length)
+                    left -= length
+                    checksum.update(data)
 
+                # create snapshot because images stores snapshot
+                image.create_snapshot()
+
+            except Exception:
+                # Note(zhiyan): clean up already received data when
+                # error occurs such as ImageSizeLimitExceeded exceptions.
+                with excutils.save_and_reraise_exception():
+                    LOG.error(_LE('Fail to write data or '
+                                  'create Sheepdog snapshot '
+                                  'src image file: %(image)s, image size: '
+                                  '%(size)s Sheepdog VDI name: %(vdiname)s.'),
+                              {'image': image_file, 'size': image_size,
+                               'vdiname': image_id})
+                    image.delete()
+
+        else:
             # create snapshot because images stores snapshot
             image.create_snapshot()
-
-        except Exception:
-            # Note(zhiyan): clean up already received data when
-            # error occurs such as ImageSizeLimitExceeded exceptions.
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Fail to write data or create Sheepdog snapshot '
-                              'src image file: %(image)s, image size: '
-                              '%(size)s Sheepdog VDI name: %(vdiname)s.'),
-                          {'image': image_file, 'size': image_size,
-                           'vdiname': image_id})
-                image.delete()
+            image_size = image.get_size()
+            try:
+                total = left = image_size
+                while left > 0:
+                    length = min(self.chunk_size, left)
+                    data = image.read(total - left, length)
+                    checksum.update(data)
+                    left -= length
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.error(_LE('Fail to read cloned image or '
+                                  'create Sheepdog snapshot'
+                                  'cloned image file: %(image)s, image size: '
+                                  '%(size)s Sheepdog VDI name: %(vdiname)s.'),
+                              {'image': image_file, 'size': image_size,
+                               'vdiname': image_id})
+                    image.delete()
 
         try:
             # delete current image, use snapshot at sheepdog
